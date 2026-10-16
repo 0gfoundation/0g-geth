@@ -71,6 +71,11 @@ type processedFees struct {
 	gasUsedRatio                 float64
 	blobGasUsedRatio             float64
 	blobBaseFee, nextBlobBaseFee *big.Int
+
+	// noTxs marks a block that held no transactions: its reward rows are
+	// placeholder zeros, kept as-is in the cache, which FeeHistory replaces
+	// with the currently suggested priority fee.
+	noTxs bool
 }
 
 // txGasAndReward is sorted in ascending order based on reward
@@ -124,10 +129,12 @@ func (oracle *Oracle) processBlock(bf *blockFees, percentiles []float64) {
 
 	bf.results.reward = make([]*big.Int, len(percentiles))
 	if len(bf.block.Transactions()) == 0 {
-		// return an all zero row if there are no transactions to gather data from
+		// return an all zero row if there are no transactions to gather data from,
+		// flagged so FeeHistory can replace it with the suggested priority fee
 		for i := range bf.results.reward {
 			bf.results.reward[i] = new(big.Int)
 		}
+		bf.results.noTxs = true
 		return
 	}
 
@@ -230,7 +237,8 @@ func (oracle *Oracle) resolveBlockRange(ctx context.Context, reqEnd rpc.BlockNum
 // are not available or when the head has changed during processing this request.
 // Five arrays are returned based on the processed blocks:
 //   - reward: the requested percentiles of effective priority fees per gas of transactions in each
-//     block, sorted in ascending order and weighted by gas used.
+//     block, sorted in ascending order and weighted by gas used. Empty blocks report the
+//     currently suggested priority fee (what eth_maxPriorityFeePerGas would return) instead.
 //   - baseFee: base fee per gas in the given block
 //   - gasUsedRatio: gasUsed/gasLimit in the given block
 //   - blobBaseFee: the blob base fee per gas in the given block
@@ -331,6 +339,15 @@ func (oracle *Oracle) FeeHistory(ctx context.Context, blocks uint64, unresolvedL
 		blobGasUsedRatio = make([]float64, blocks)
 		blobBaseFee      = make([]*big.Int, blocks+1)
 		firstMissing     = blocks
+
+		// Empty blocks have no transaction data to sample, so their reward rows
+		// report the suggested priority fee (what eth_maxPriorityFeePerGas would
+		// return at request time) instead of zeros. The suggestion is computed at
+		// most once per request, and only when the range holds an empty block; if
+		// it fails, the zero rows are kept.
+		tipCap     *big.Int
+		tipCapErr  error
+		tipCapDone bool
 	)
 	for ; blocks > 0; blocks-- {
 		fees := <-results
@@ -339,6 +356,20 @@ func (oracle *Oracle) FeeHistory(ctx context.Context, blocks uint64, unresolvedL
 		}
 		i := fees.blockNumber - oldestBlock
 		if fees.results.baseFee != nil {
+			if fees.results.noTxs {
+				if !tipCapDone {
+					tipCap, tipCapErr = oracle.SuggestTipCap(ctx)
+					tipCapDone = true
+				}
+				if tipCapErr == nil {
+					// Allocate a new row; the one held in the cache must keep its zeros.
+					row := make([]*big.Int, len(fees.results.reward))
+					for j := range row {
+						row[j] = new(big.Int).Set(tipCap)
+					}
+					fees.results.reward = row
+				}
+			}
 			reward[i], baseFee[i], baseFee[i+1], gasUsedRatio[i] = fees.results.reward, fees.results.baseFee, fees.results.nextBaseFee, fees.results.gasUsedRatio
 			blobGasUsedRatio[i], blobBaseFee[i], blobBaseFee[i+1] = fees.results.blobGasUsedRatio, fees.results.blobBaseFee, fees.results.nextBlobBaseFee
 		} else {
